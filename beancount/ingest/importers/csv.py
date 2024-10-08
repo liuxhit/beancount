@@ -18,6 +18,7 @@ import enum
 import io
 from inspect import signature
 from typing import Callable, Dict, Optional, Union
+import sys
 
 import dateutil.parser
 
@@ -216,11 +217,37 @@ class Importer(identifier.IdentifyMixin, filing.FilingMixin):
                     continue
                 if row[0].startswith("#"):
                     continue
-                date_str = row[iconfig[Col.DATE]]
-                date = parse_date_liberally(date_str, self.dateutil_kwds)
+                date_str = self.get_field(row, Col.DATE, iconfig)
+                date = self.try_parse_date(date_str, self.dateutil_kwds)
                 if max_date is None or date > max_date:
                     max_date = date
             return max_date
+
+    
+    @staticmethod
+    def get_field(row, ftype, iconfig):
+        '''
+        Function to get a field value from one row, given field name(ftype) and iconfig.
+        Overwrite if necessary.
+        '''
+        try:
+            if ftype not in iconfig:
+                return None
+            
+            if isinstance(iconfig[ftype], int):  # read csv field using index number directly
+                return row[iconfig[ftype]]
+            elif callable(iconfig[ftype]):  # custom logic
+                return iconfig[ftype](row)
+        except IndexError:  # FIXME: this should not happen
+            return None
+    
+    def try_parse_date(self, date, dateutil_kwds):
+        try:
+            return parse_date_liberally(date, dateutil_kwds)
+        except dateutil.parser._parser.ParserError as e:
+            if self.debug:
+                print(f'faild to parse date from string: {date}, error: {e}', file=sys.stderr)
+            return None
 
     def extract(self, file, existing_entries=None):
         account = self.file_account(file)
@@ -247,29 +274,31 @@ class Importer(identifier.IdentifyMixin, filing.FilingMixin):
             next(reader)
 
         def get(row, ftype):
-            try:
-                return row[iconfig[ftype]] if ftype in iconfig else None
-            except IndexError:  # FIXME: this should not happen
-                return None
+            return self.get_field(row, ftype, iconfig)
 
         # Parse all the transactions.
         first_row = last_row = None
         for index, row in enumerate(reader, 1):
+            # If debugging, print out the rows.
+            if self.debug:
+                print(row, file=sys.stderr)
+            
             if not row:
                 continue
             if row[0].startswith("#"):
                 continue
 
-            # If debugging, print out the rows.
-            if self.debug:
-                print(row)
+            # Extract the data we need from the row, based on the configuration.
+            # We check date field first, as this infomation must needs to be valid.
+            date = get(row, Col.DATE)
+            date = self.try_parse_date(date, self.dateutil_kwds)
+            if not date:
+                continue
 
             if first_row is None:
                 first_row = row
             last_row = row
 
-            # Extract the data we need from the row, based on the configuration.
-            date = get(row, Col.DATE)
             txn_date = get(row, Col.TXN_DATE)
             txn_time = get(row, Col.TXN_TIME)
 
@@ -309,7 +338,11 @@ class Importer(identifier.IdentifyMixin, filing.FilingMixin):
             if last4:
                 last4_friendly = self.last4_map.get(last4.strip())
                 meta["card"] = last4_friendly if last4_friendly else last4
-            date = parse_date_liberally(date, self.dateutil_kwds)
+            if get(row, '[TXN_SOURCE]'):
+                meta["source"] = get(row, '[TXN_SOURCE]')
+            meta["narration1"] = get(row, Col.NARRATION1)
+            meta["narration2"] = get(row, Col.NARRATION2)
+            meta["narration3"] = get(row, Col.NARRATION3)
             txn = data.Transaction(meta, date, self.FLAG, payee, narration, tags, links, [])
 
             # Attach one posting to the transaction
@@ -358,8 +391,8 @@ class Importer(identifier.IdentifyMixin, filing.FilingMixin):
                 )
 
         # Remove the 'balance' metadata.
-        for entry in entries:
-            entry.meta.pop("balance", None)
+        # for entry in entries:
+        #     entry.meta.pop("balance", None)
 
         return entries
 
